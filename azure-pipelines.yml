@@ -1,0 +1,174 @@
+# =========================
+# Pipeline Name (Build Number)
+# =========================
+name: 1.0.$(Rev:r)
+
+# =========================
+# Trigger
+# =========================
+trigger:
+- main
+
+# =========================
+# Agent Pool
+# =========================
+pool:
+  vmImage: ubuntu-latest
+
+# =========================================================
+# SINGLE JOB PIPELINE
+# Build → Security → Sonar → Docker
+# =========================================================
+jobs:
+- job: FullPipeline
+  displayName: 'Build, Scan, Analyze, Dockerize'
+
+  steps:
+  # =========================
+  # Checkout Code
+  # =========================
+  - checkout: self
+    displayName: 'Clone repository'
+
+  # =========================
+  # Maven Build
+  # =========================
+  - task: Maven@3
+    displayName: 'Build with Maven'
+    inputs:
+      mavenPomFile: 'pom.xml'
+      goals: 'clean package'
+
+  # =========================
+  # Verify JAR Output
+  # =========================
+  - script: |
+      ls -al target/
+    displayName: 'List target folder'
+
+  # =========================
+  # Upload JAR to Azure Blob Storage
+  # =========================
+  - task: AzureCLI@2
+    displayName: 'Upload JAR to Azure Blob Storage'
+    inputs:
+      azureSubscription: 'blob-storage-connection-01'
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az storage blob upload \
+          --account-name firststorageaccountvenky \
+          --container-name 1stcontainer \
+          --file target/spring-boot-mongo-1.0.jar \
+          --name spring-boot-mongo-1.0.jar \
+          --overwrite \
+          --auth-mode login
+
+  # =========================
+  # Prepare Artifact for Azure Artifacts
+  # =========================
+  - script: |
+      mkdir artifact
+      cp target/spring-boot-mongo-1.0.jar artifact/
+    displayName: 'Prepare JAR for Azure Artifacts'
+
+  # =========================
+  # Publish to Azure Artifacts
+  # =========================
+  - task: UniversalPackages@0
+    displayName: 'Upload JAR to Azure Artifacts'
+    inputs:
+      command: publish
+      publishDirectory: 'artifact'
+      feedsToUse: internal
+      vstsFeedPublish: 'feed-01'
+      vstsFeedPackagePublish: 'spring-boot-mongo'
+      versionOption: custom
+      versionPublish: '$(Build.BuildNumber)'
+      packagePublishDescription: 'Spring Boot Mongo JAR'
+
+  # =========================
+  # Trivy File System Scan
+  # =========================
+  - script: |
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+
+      ./bin/trivy fs --severity HIGH,CRITICAL --exit-code 1 .
+
+      ./bin/trivy fs -f json -o trivy-report.json .
+    displayName: 'Run Trivy File System Scan'
+
+  # =========================
+  # Publish Trivy Report
+  # =========================
+  - publish: trivy-report.json
+    artifact: TrivyReport
+    displayName: 'Publish Trivy Scan Report'
+
+  # =========================
+  # Maven Build for SonarCloud
+  # =========================
+  - task: Maven@3
+    displayName: 'Build for SonarCloud'
+    inputs:
+      mavenPomFile: 'pom.xml'
+      goals: 'clean verify'
+
+  # =========================
+  # SonarCloud Scan
+  # =========================
+  - script: |
+      mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.10.0.2594:sonar \
+        -Dsonar.projectKey=DevOps1storgvenkat_SpringBootApp \
+        -Dsonar.organization=devops1storgvenkat \
+        -Dsonar.host.url=https://sonarcloud.io \
+        -Dsonar.login=58e6fddff9329b707cf49890b484684014c03e4b
+    displayName: 'Run SonarCloud Scan'
+
+  # =========================
+  # Login to Azure Container Registry
+  # =========================
+  - task: AzureCLI@2
+    displayName: 'ACR Login'
+    inputs:
+      azureSubscription: 'acr-service-connection'
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az acr login --name 1stacrregistry
+
+  # =========================
+  # Build Docker Image
+  # =========================
+  - task: Docker@2
+    displayName: 'Build Docker image'
+    inputs:
+      command: build
+      Dockerfile: Dockerfile
+      repository: 1stacrregistry.azurecr.io/my-maven-app
+      tags: |
+        $(Build.BuildId)
+
+  # =========================
+  # Push Docker Image
+  # =========================
+  - task: Docker@2
+    displayName: 'Push Docker image'
+    inputs:
+      command: push
+      repository: 1stacrregistry.azurecr.io/my-maven-app
+      tags: |
+        $(Build.BuildId)
+
+  # =========================
+  # Build & Push using Service Principal
+  # =========================
+  - task: Docker@2
+    displayName: 'Build and Push Docker image (Service Principal)'
+    inputs:
+      command: buildAndPush
+      containerRegistry: acr-2nd-service-principal
+      Dockerfile: Dockerfile
+      repository: my-maven-app
+      tags: |
+        $(Build.BuildId)
